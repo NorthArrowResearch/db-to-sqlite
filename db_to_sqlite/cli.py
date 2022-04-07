@@ -66,112 +66,112 @@ def cli(
     for table_name, column_name in redact:
         redact_columns.setdefault(table_name, set()).add(column_name)
     db = Database(path)
-    if postgres_schema:
-        conn_args = {"options": "-csearch_path={}".format(postgres_schema)}
-    else:
-        conn_args = {}
-    if connection.startswith("postgres://"):
-        connection = connection.replace("postgres://", "postgresql://")
-    db_conn = create_engine(connection, connect_args=conn_args).connect()
-    inspector = inspect(db_conn)
-    # Figure out which tables we are copying, if any
-    tables = table
-    if all:
-        tables = inspector.get_table_names()
-    if tables:
-        foreign_keys_to_add = []
-        for i, table in enumerate(tables):
-            if progress:
-                click.echo("{}/{}: {}".format(i + 1, len(tables), table), err=True)
-            if table in skip:
+    # build list of schema names from comma separated argument.
+    schemas = postgres_schema.split(',') if postgres_schema is not None else [None]
+    for schema in schemas:
+        conn_args = {"options": "-csearch_path={}".format(schema)} if schema is not None else {}
+        if connection.startswith("postgres://"):
+            connection = connection.replace("postgres://", "postgresql://")
+        db_conn = create_engine(connection, connect_args=conn_args).connect()
+        inspector = inspect(db_conn)
+        # Figure out which tables we are copying, if any
+        tables = table
+        if all:
+            tables = inspector.get_table_names()
+        if tables:
+            foreign_keys_to_add = []
+            for i, table in enumerate(tables):
                 if progress:
-                    click.echo("  ... skipping", err=True)
-                continue
-            pks = inspector.get_pk_constraint(table)["constrained_columns"]
-            if len(pks) == 1:
-                pks = pks[0]
-            fks = inspector.get_foreign_keys(table)
-            foreign_keys_to_add.extend(
-                [
-                    (
-                        # table, column, other_table, other_column
-                        table,
-                        fk["constrained_columns"][0],
-                        fk["referred_table"],
-                        fk["referred_columns"][0],
-                    )
-                    for fk in fks
-                ]
-            )
-            count = None
-            table_quoted = db_conn.dialect.identifier_preparer.quote_identifier(table)
-            if progress:
-                count = db_conn.execute(
-                    "select count(*) from {}".format(table_quoted)
-                ).fetchone()[0]
-            results = db_conn.execute("select * from {}".format(table_quoted))
-            redact_these = redact_columns.get(table) or set()
-            rows = (redacted_dict(r, redact_these) for r in results)
-            # Make sure generator is not empty
-            try:
-                first = next(rows)
-            except StopIteration:
-                # This is an empty table - create an empty copy
-                if not db[table].exists():
-                    create_columns = {}
-                    for column in inspector.get_columns(table):
-                        try:
-                            column_type = column["type"].python_type
-                        except NotImplementedError:
-                            column_type = str
-                        create_columns[column["name"]] = column_type
-                    db[table].create(create_columns)
-            else:
-                rows = itertools.chain([first], rows)
+                    click.echo("{}/{}: {}".format(i + 1, len(tables), table), err=True)
+                if table in skip:
+                    if progress:
+                        click.echo("  ... skipping", err=True)
+                    continue
+                pks = inspector.get_pk_constraint(table)["constrained_columns"]
+                if len(pks) == 1:
+                    pks = pks[0]
+                fks = inspector.get_foreign_keys(table)
+                foreign_keys_to_add.extend(
+                    [
+                        (
+                            # table, column, other_table, other_column
+                            table,
+                            fk["constrained_columns"][0],
+                            fk["referred_table"],
+                            fk["referred_columns"][0],
+                        )
+                        for fk in fks
+                    ]
+                )
+                count = None
+                table_quoted = db_conn.dialect.identifier_preparer.quote_identifier(table)
                 if progress:
-                    with click.progressbar(rows, length=count) as bar:
-                        db[table].insert_all(bar, pk=pks, replace=True)
+                    count = db_conn.execute(
+                        "select count(*) from {}".format(table_quoted)
+                    ).fetchone()[0]
+                results = db_conn.execute("select * from {}".format(table_quoted))
+                redact_these = redact_columns.get(table) or set()
+                rows = (redacted_dict(r, redact_these) for r in results)
+                # Make sure generator is not empty
+                try:
+                    first = next(rows)
+                except StopIteration:
+                    # This is an empty table - create an empty copy
+                    if not db[table].exists():
+                        create_columns = {}
+                        for column in inspector.get_columns(table):
+                            try:
+                                column_type = column["type"].python_type
+                            except NotImplementedError:
+                                column_type = str
+                            create_columns[column["name"]] = column_type
+                        db[table].create(create_columns)
                 else:
-                    db[table].insert_all(rows, pk=pks, replace=True)
-        foreign_keys_to_add_final = []
-        for table, column, other_table, other_column in foreign_keys_to_add:
-            # Make sure both tables exist and are not skipped - they may not
-            # exist if they were empty and hence .insert_all() didn't have a
-            # reason to create them.
-            if (
-                db[table].exists()
-                and table not in skip
-                and db[other_table].exists()
-                and other_table not in skip
-                # Also skip if this column is redacted
-                and ((table, column) not in redact)
-            ):
-                foreign_keys_to_add_final.append(
-                    (table, column, other_table, other_column)
-                )
-        if foreign_keys_to_add_final:
-            # Add using .add_foreign_keys() to avoid running multiple VACUUMs
-            if progress:
-                click.echo(
-                    "\nAdding {} foreign key{}\n{}".format(
-                        len(foreign_keys_to_add_final),
-                        "s" if len(foreign_keys_to_add_final) != 1 else "",
-                        "\n".join(
-                            "  {}.{} => {}.{}".format(*fk)
-                            for fk in foreign_keys_to_add_final
+                    rows = itertools.chain([first], rows)
+                    if progress:
+                        with click.progressbar(rows, length=count) as bar:
+                            db[table].insert_all(bar, pk=pks, replace=True)
+                    else:
+                        db[table].insert_all(rows, pk=pks, replace=True)
+            foreign_keys_to_add_final = []
+            for table, column, other_table, other_column in foreign_keys_to_add:
+                # Make sure both tables exist and are not skipped - they may not
+                # exist if they were empty and hence .insert_all() didn't have a
+                # reason to create them.
+                if (
+                    db[table].exists()
+                    and table not in skip
+                    and db[other_table].exists()
+                    and other_table not in skip
+                    # Also skip if this column is redacted
+                    and ((table, column) not in redact)
+                ):
+                    foreign_keys_to_add_final.append(
+                        (table, column, other_table, other_column)
+                    )
+            if foreign_keys_to_add_final:
+                # Add using .add_foreign_keys() to avoid running multiple VACUUMs
+                if progress:
+                    click.echo(
+                        "\nAdding {} foreign key{}\n{}".format(
+                            len(foreign_keys_to_add_final),
+                            "s" if len(foreign_keys_to_add_final) != 1 else "",
+                            "\n".join(
+                                "  {}.{} => {}.{}".format(*fk)
+                                for fk in foreign_keys_to_add_final
+                            ),
                         ),
-                    ),
-                    err=True,
-                )
-            db.add_foreign_keys(foreign_keys_to_add_final)
-    if sql:
-        if not output:
-            raise click.ClickException("--sql must be accompanied by --output")
-        results = db_conn.execute(sql)
-        rows = (dict(r) for r in results)
-        db[output].insert_all(rows, pk=pk)
-    if index_fks:
-        db.index_foreign_keys()
+                        err=True,
+                    )
+                db.add_foreign_keys(foreign_keys_to_add_final)
+        if sql:
+            if not output:
+                raise click.ClickException("--sql must be accompanied by --output")
+            results = db_conn.execute(sql)
+            rows = (dict(r) for r in results)
+            db[output].insert_all(rows, pk=pk)
+        if index_fks:
+            db.index_foreign_keys()
 
 
 def detect_primary_key(db_conn, table):
